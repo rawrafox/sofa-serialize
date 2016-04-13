@@ -1,6 +1,7 @@
 extern crate byteorder;
 extern crate rustc_serialize;
 
+pub mod decoder;
 pub mod encoder;
 
 use std::collections::BTreeMap;
