@@ -2,7 +2,46 @@ use std::cmp;
 use std::io;
 use std::str;
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{self, LittleEndian, ReadBytesExt};
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorCode {
+    EndOfStream,
+    InvalidDictionaryIndex,
+    InvalidLength,
+    InvalidType,
+    InvalidUTF8,
+    UnexpectedEOF
+}
+
+#[derive(Debug)]
+pub enum DecoderError {
+    StreamError(ErrorCode),
+    IoError(io::Error)
+}
+
+impl From<byteorder::Error> for DecoderError {
+    fn from(error: byteorder::Error) -> DecoderError {
+        return DecoderError::IoError(From::from(error));
+    }
+}
+
+impl From<io::Error> for DecoderError {
+    fn from(error: io::Error) -> DecoderError {
+        return DecoderError::IoError(error);
+    }
+}
+
+impl PartialEq for DecoderError {
+    fn eq(&self, other: &DecoderError) -> bool {
+        return match (self, other) {
+            (&DecoderError::StreamError(ref m0), &DecoderError::StreamError(ref m1)) => m0 == m1,
+            _ => false
+        };
+    }
+}
+
+pub type DecoderResult<T> = Result<T, DecoderError>;
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
 pub enum Event<'a> {
@@ -61,27 +100,29 @@ impl<'a> Decoder<'a> {
     }
 
     #[inline]
-    fn read_length(&mut self) -> io::Result<usize> {
+    fn read_length(&mut self) -> DecoderResult<usize> {
         let result = match try!(self.reader.read_u8()) {
             x if x < 0xEF => x as usize,
             0xF1 => try!(self.reader.read_u8()) as usize,
             0xF2 => try!(self.reader.read_u16::<LittleEndian>()) as usize,
             0xF3 => try!(self.reader.read_u32::<LittleEndian>()) as usize,
             0xF4 => try!(self.reader.read_u64::<LittleEndian>()) as usize,
-            _ => panic!("Not implemented yet")
+            _ => {
+                return Err(DecoderError::StreamError(ErrorCode::InvalidLength));
+            }
         };
 
         return Ok(result);
     }
 
     #[inline]
-    fn read_binary(&mut self) -> io::Result<&'a [u8]> {
+    fn read_binary(&mut self) -> DecoderResult<&'a [u8]> {
         let length = try!(self.read_length());
 
         let buffer = self.reader.fill_buffer();
 
         if length > buffer.len() {
-            panic!("Not implemented yet");
+            return Err(DecoderError::StreamError(ErrorCode::UnexpectedEOF));
         }
 
         let buffer = &buffer[..length];
@@ -92,7 +133,7 @@ impl<'a> Decoder<'a> {
     }
 
     #[inline]
-    fn read_string(&mut self) -> io::Result<&'a str> {
+    fn read_string(&mut self) -> DecoderResult<&'a str> {
         let length = match try!(self.reader.read_u8()) {
             x if x < 0xEF => x as usize,
             0xF1 => try!(self.reader.read_u8()) as usize,
@@ -119,37 +160,37 @@ impl<'a> Decoder<'a> {
 
                 return self.read_dictionary(index as usize);
             }
-            _ => panic!("Not implemented yet")
+            _ => {
+                return Err(DecoderError::StreamError(ErrorCode::InvalidLength));
+            }
         };
 
         return self.read_string_data(length);
     }
 
     #[inline]
-    fn read_string_data(&mut self, length: usize) -> io::Result<&'a str> {
+    fn read_string_data(&mut self, length: usize) -> DecoderResult<&'a str> {
         let buffer = self.reader.fill_buffer();
 
         if length > buffer.len() {
-            panic!("Not implemented yet");
+            return Err(DecoderError::StreamError(ErrorCode::UnexpectedEOF));
         }
 
         let buffer = &buffer[..length];
 
         self.reader.consume(length);
 
-        let result = match str::from_utf8(buffer) {
-            Ok(s) => s,
-            Err(_) => panic!("Not implemented yet")
+        return match str::from_utf8(buffer) {
+            Ok(s) => Ok(s),
+            Err(_) => Err(DecoderError::StreamError(ErrorCode::InvalidUTF8))
         };
-
-        return Ok(result);
     }
 
     #[inline]
-    fn read_dictionary(&mut self, index: usize) -> io::Result<&'a str> {
+    fn read_dictionary(&mut self, index: usize) -> DecoderResult<&'a str> {
         return match self.dictionary.get(index) {
             Some(s) => Ok(s),
-            None => panic!("Not implemented yet")
+            None => Err(DecoderError::StreamError(ErrorCode::InvalidDictionaryIndex))
         };
     }
 
@@ -158,7 +199,7 @@ impl<'a> Decoder<'a> {
         self.stack.push(remaining);
     }
 
-    pub fn read(&mut self) -> io::Result<Option<Event<'a>>> {
+    pub fn read(&mut self) -> DecoderResult<Option<Event<'a>>> {
         match self.stack.pop() {
             Some(remaining) => {
                 if remaining == 0 {
@@ -236,14 +277,18 @@ impl<'a> Decoder<'a> {
 
                         return Ok(Some(Event::StartMap(Some(length))));
                     }
-                    _ => panic!("Not implemented yet")
+                    _ => {
+                        return Err(DecoderError::StreamError(ErrorCode::InvalidType));
+                    }
                 };
 
                 self.push_stack(remaining - 1);
 
                 return Ok(Some(result));
             }
-            None => panic!("Not implemented yet")
+            None => {
+                return Err(DecoderError::StreamError(ErrorCode::EndOfStream));
+            }
         }
     }
 }
@@ -307,49 +352,3 @@ mod tests {
     basic_test!(decodes_f64, vec![0x1B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F], vec![Event::F64(1.0)]);
 
 }
-
-// use std::collections::BTreeMap;
-// use std::io;
-// use std::io::Read;
-// use std::{i8, i16, i32, i64};
-//
-//
-// pub enum ErrorCode {
-//     InvalidType,
-//     InvalidLength,
-//     InvalidDictionaryEntry,
-//     UnexpectedEOF,
-//     NotUTF8
-// }
-//
-// #[derive(Debug)]
-// pub enum ParserError {
-//     StreamError(ErrorCode, usize),
-//     IoError(io::Error)
-// }
-//
-// impl PartialEq for ParserError {
-//     fn eq(&self, other: &ParserError) -> bool {
-//         match (self, other) {
-//             (&StreamError(m0, o0), &StreamError(m1, o1)) => m0 == m1 && o0 == o1,
-//             _ => false
-//         }
-//     }
-// }
-//
-//
-// pub struct Decoder<'a> {
-//     buffer: &'a [u8],
-//     reader: &'a io::Read,
-//     dictionary: Vec<String>
-// }
-//
-// impl<'a> Parser<'a> {
-//     pub fn new(buffer: &'a [u8], dictionary: Vec<String>) -> Parser<'a> {
-//         return Decoder { buffer: buffer, reader: buffer, dictionary: dictionary };
-//     }
-//
-//     // pub fn read_event(&mut self) -> ParserError<SofaEvent> {
-//     //     return Ok(());
-//     // }
-// }
