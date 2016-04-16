@@ -1,360 +1,310 @@
-use std::collections::BTreeMap;
+use std::collections;
 use std::io;
-use std::io::Write;
-use std::{i8, i16, i32, i64};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
+use super::Event;
+
+use encoder_error::{ErrorCode, EncoderError, EncoderResult};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Size { U64(u64), Streaming(usize, usize, usize) }
+
 pub struct Encoder<'a> {
-    writer: &'a mut (io::Write + 'a),
-    dictionary: BTreeMap<String, u64>
+    writer: &'a mut io::Write,
+    dictionary: collections::HashMap<&'a str, usize>,
+    stack: Vec<Size>
 }
 
 impl<'a> Encoder<'a> {
-    pub fn new(writer: &'a mut io::Write, dictionary: Vec<String>) -> Encoder<'a> {
-        let mut map = BTreeMap::new();
+    pub fn new(writer: &'a mut io::Write, dictionary: &'a [&'a str]) -> Encoder<'a> {
+        let mut map = collections::HashMap::new();
 
         for (i, e) in dictionary.iter().enumerate() {
-            map.insert(e.clone(), i as u64);
+            map.insert(*e, i);
         }
 
-        return Encoder { writer: writer, dictionary: map };
+        return Encoder { writer: writer, dictionary: map, stack: vec![Size::U64(1)] };
     }
 
-    fn emit_length(&mut self, length: u64) -> io::Result<()> {
+    #[inline]
+    fn write_length(&mut self, length: Size) -> EncoderResult<()> {
         match length {
-            x if x < 0xF0 => {
-                try!(self.writer.write_u8(x as u8));
+            Size::U64(length) if length < 0xEF => {
+                try!(self.writer.write_u8(length as u8))
             }
-            x if x <= 0xFF => {
-                try!(self.writer.write_u8(0xF0));
-                try!(self.writer.write_u8(x as u8));
-            }
-            x if x <= 0xFFFF => {
-                try!(self.writer.write_u8(0xF1));
-                try!(self.writer.write_u16::<LittleEndian>(x as u16));
-            }
-            x if x <= 0xFFFFFFFF => {
-                try!(self.writer.write_u8(0xF2));
-                try!(self.writer.write_u32::<LittleEndian>(x as u32));
-            }
-            x => {
-                try!(self.writer.write_u8(0xF3));
-                try!(self.writer.write_u64::<LittleEndian>(x as u64));
-            }
+            _ => panic!("Not implemented yet")
         }
 
         return Ok(());
     }
 
-    fn emit_dictionary_string(&mut self, n: u64) -> io::Result<()> {
-        match n {
-            x if x <= 0xFF => {
-                try!(self.writer.write_u8(0xF4));
-                try!(self.writer.write_u8(x as u8));
+    #[inline]
+    fn write_string(&mut self, s: &str) -> EncoderResult<()> {
+        if let Some(i) = self.dictionary.get(s) {
+            if *i <= 0b01111111 {
+                try!(self.writer.write_u8(*i as u8 | 0b10000000));
+            } else {
+                panic!("Not implemented yet");
             }
-            x if x <= 0xFFFF => {
-                try!(self.writer.write_u8(0xF5));
-                try!(self.writer.write_u16::<LittleEndian>(x as u16));
-            }
-            x if x <= 0xFFFFFFFF => {
-                try!(self.writer.write_u8(0xF6));
-                try!(self.writer.write_u32::<LittleEndian>(x as u32));
-            }
-            x => {
-                try!(self.writer.write_u8(0xF7));
-                try!(self.writer.write_u64::<LittleEndian>(x as u64));
-            }
+
+            return Ok(());
         }
+
+        try!(self.writer.write_u8(0x09));
+        try!(self.write_length(Size::U64(s.len() as u64)));
+        try!(self.writer.write_all(s.as_bytes()));
 
         return Ok(());
     }
 
-    pub fn emit_string_fragment(&mut self, string: &str) -> io::Result<()> {
-        let slice = string.as_bytes();
+    #[inline]
+    fn push_stack(&mut self, remaining: Size) {
+        match remaining {
+            Size::U64(s) => self.stack.push(Size::U64(s - 1)),
+            Size::Streaming(n, modulo, required) => self.stack.push(Size::Streaming(n + 1, modulo, required))
+        }
+    }
 
-        let dictionary_index = self.dictionary.get(string).map(|x| *x);
+    #[inline]
+    fn push_stack_structure(&mut self, remaining: Size, structure_size: Size) {
+        self.push_stack(remaining);
+        self.stack.push(structure_size);
+    }
 
-        match dictionary_index {
-            Some(i) => try!(self.emit_dictionary_string(i)),
+
+    pub fn write(&mut self, event: &Event) -> EncoderResult<()> {
+        match self.stack.pop() {
+            Some(Size::U64(0)) => {
+                if *event != Event::End {
+                    return Err(EncoderError::StreamError(ErrorCode::MissingEnd));
+                } else {
+                    if self.stack.len() != 0 {
+                        return Ok(());
+                    } else {
+                        return Err(EncoderError::StreamError(ErrorCode::EndOfStream));
+                    }
+                }
+            }
+            Some(remaining) => {
+                match *event {
+                    Event::Nil => {
+                        try!(self.writer.write_u8(0x01))
+                    }
+                    Event::Boolean(false) => {
+                        try!(self.writer.write_u8(0x02))
+                    }
+                    Event::Boolean(true) => {
+                        try!(self.writer.write_u8(0x03))
+                    }
+                    Event::U8(v) => {
+                        try!(self.writer.write_u8(0x10));
+                        try!(self.writer.write_u8(v));
+                    }
+                    Event::U16(v) => {
+                        try!(self.writer.write_u8(0x11));
+                        try!(self.writer.write_u16::<LittleEndian>(v));
+                    }
+                    Event::U32(v) => {
+                        try!(self.writer.write_u8(0x12));
+                        try!(self.writer.write_u32::<LittleEndian>(v));
+                    }
+                    Event::U64(v) => {
+                        try!(self.writer.write_u8(0x13));
+                        try!(self.writer.write_u64::<LittleEndian>(v));
+                    }
+                    Event::I8(v) => {
+                        try!(self.writer.write_u8(0x14));
+                        try!(self.writer.write_i8(v));
+                    }
+                    Event::I16(v) => {
+                        try!(self.writer.write_u8(0x15));
+                        try!(self.writer.write_i16::<LittleEndian>(v));
+                    }
+                    Event::I32(v) => {
+                        try!(self.writer.write_u8(0x16));
+                        try!(self.writer.write_i32::<LittleEndian>(v));
+                    }
+                    Event::I64(v) => {
+                        try!(self.writer.write_u8(0x17));
+                        try!(self.writer.write_i64::<LittleEndian>(v));
+                    }
+                    Event::Fixnum(_) => {
+                        panic!("Not implemented yet");
+                    }
+                    Event::F32(v) => {
+                        try!(self.writer.write_u8(0x1A));
+                        try!(self.writer.write_f32::<LittleEndian>(v));
+                    }
+                    Event::F64(v) => {
+                        try!(self.writer.write_u8(0x1B));
+                        try!(self.writer.write_f64::<LittleEndian>(v));
+                    }
+                    Event::Binary(v) => {
+                        try!(self.writer.write_u8(0x08));
+                        try!(self.write_length(Size::U64(v.len() as u64)));
+                        try!(self.writer.write_all(v));
+                    }
+                    Event::String(v) => try!(self.write_string(v)),
+                    Event::StartArray(v) => {
+                        match v {
+                            Some(length) if length < 0b00001111 => {
+                                try!(self.writer.write_u8(0b00100000 | length as u8));
+
+                                self.push_stack_structure(remaining, Size::U64(length as u64));
+
+                                return Ok(());
+                            }
+                            x => {
+                                let structure_size = match x {
+                                    None => Size::Streaming(0, 1, 0),
+                                    Some(size) => Size::U64(size as u64)
+                                };
+
+                                self.push_stack_structure(remaining, structure_size);
+
+                                try!(self.writer.write_u8(0x0A));
+
+                                return self.write_length(structure_size);
+                            }
+                        }
+                    }
+                    Event::StartStruct(v) => {
+                        let stack_size = match v {
+                            None => Size::Streaming(0, 1, 1),
+                            Some(size) => Size::U64(1 + size as u64)
+                        };
+
+                        let structure_size = match v {
+                            None => Size::Streaming(0, 1, 1),
+                            Some(size) => Size::U64(size as u64)
+                        };
+
+                        self.push_stack_structure(remaining, stack_size);
+
+                        try!(self.writer.write_u8(0x0B));
+
+                        return self.write_length(structure_size);
+                    }
+                    Event::StartMap(v) => {
+                        match v {
+                            Some(length) if length < 0b00001111 => {
+                                try!(self.writer.write_u8(0b00110000 | length as u8));
+
+                                self.push_stack_structure(remaining, Size::U64(2 * length as u64));
+
+                                return Ok(());
+                            }
+                            x => {
+                                let structure_size = match x {
+                                    None => Size::Streaming(0, 2, 0),
+                                    Some(size) => Size::U64(2 * size as u64)
+                                };
+
+                                self.push_stack_structure(remaining, structure_size);
+
+                                try!(self.writer.write_u8(0x0C));
+
+                                return self.write_length(structure_size);
+                            }
+                        }
+                    }
+                    Event::StartOpenStruct(v) => {
+                        let stack_size = match v {
+                            None => Size::Streaming(0, 2, 1),
+                            Some(size) => Size::U64(1 + 2 * size as u64)
+                        };
+
+                        let structure_size = match v {
+                            None => Size::Streaming(0, 2, 1),
+                            Some(size) => Size::U64(size as u64)
+                        };
+
+                        self.push_stack_structure(remaining, stack_size);
+
+                        try!(self.writer.write_u8(0x0D));
+
+                        return self.write_length(structure_size);
+                    }
+                    Event::End => {
+                        return match remaining {
+                            Size::Streaming(n, modulo, required) if n >= required && n % modulo == required => Ok(()),
+                            Size::U64(0) => Ok(()),
+                            _ => Err(EncoderError::StreamError(ErrorCode::InvalidEnd))
+                        };
+                    }
+                }
+
+                self.push_stack(remaining);
+            }
             None => {
-                try!(self.emit_length(slice.len() as u64));
-                try!(self.writer.write_all(slice));
+                return Err(EncoderError::StreamError(ErrorCode::EndOfStream));
             }
         }
 
         return Ok(());
     }
-
-    pub fn emit_nil(&mut self) -> io::Result<()> {
-        try!(self.writer.write_u8(0x01));
-
-        return Ok(());
-    }
-
-    pub fn emit_bool(&mut self, v: bool) -> io::Result<()> {
-        try!(self.writer.write_u8(if v { 0x03 } else { 0x02} ));
-
-        return Ok(());
-    }
-
-    pub fn emit_u8(&mut self, v: u8) -> io::Result<()> {
-        try!(self.writer.write_u8(0x10));
-        try!(self.writer.write_u8(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_u16(&mut self, v: u16) -> io::Result<()> {
-        try!(self.writer.write_u8(0x11));
-        try!(self.writer.write_u16::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_u32(&mut self, v: u32) -> io::Result<()> {
-        try!(self.writer.write_u8(0x12));
-        try!(self.writer.write_u32::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_u64(&mut self, v: u64) -> io::Result<()> {
-        try!(self.writer.write_u8(0x13));
-        try!(self.writer.write_u64::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_i8(&mut self, v: i8) -> io::Result<()> {
-        try!(self.writer.write_u8(0x20));
-        try!(self.writer.write_i8(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_i16(&mut self, v: i16) -> io::Result<()> {
-        try!(self.writer.write_u8(0x21));
-        try!(self.writer.write_i16::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_i32(&mut self, v: i32) -> io::Result<()> {
-        try!(self.writer.write_u8(0x22));
-        try!(self.writer.write_i32::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_i64(&mut self, v: i64) -> io::Result<()> {
-        try!(self.writer.write_u8(0x23));
-        try!(self.writer.write_i64::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_fixnum_from_u64(&mut self, v: u64) -> io::Result<()> {
-        // TODO: This does not produce canonical fixnums for numbers 5 and 6 bytes long
-        // TODO: This should probably use some sort of clz thing
-        if v < 16  {
-            try!(self.writer.write_u8(0x80 + (v as u8 & 0x1F)));
-        } else if v <= i8::MAX as u64 {
-            try!(self.writer.write_u8(0x24));
-            try!(self.writer.write_i8(v as i8));
-        } else if v <= i16::MAX as u64 {
-            try!(self.writer.write_u8(0x25));
-            try!(self.writer.write_i16::<LittleEndian>(v as i16));
-        } else if v <= i32::MAX as u64 {
-            try!(self.writer.write_u8(0x26));
-            try!(self.writer.write_i32::<LittleEndian>(v as i32));
-        } else if v <= i64::MAX as u64 {
-            try!(self.writer.write_u8(0x27));
-            try!(self.writer.write_i64::<LittleEndian>(v as i64));
-        } else {
-            try!(self.writer.write_u8(0x28));
-            try!(self.emit_length(9));
-            try!(self.writer.write_u8(0x00));
-            try!(self.writer.write_u64::<LittleEndian>(v));
-        }
-
-        return Ok(());
-    }
-
-    pub fn emit_fixnum_from_i64(&mut self, v: i64) -> io::Result<()> {
-        // TODO: This does not produce canonical fixnums for numbers 5 and 6 bytes long
-        // TODO: This should probably use some sort of clz thing
-        if v >= -16 && v < 16 {
-            try!(self.writer.write_u8(0x80 + (v as u8 & 0x1F)));
-        } else if v >= i8::MIN as i64 && v <= i8::MAX as i64 {
-            try!(self.writer.write_u8(0x24));
-            try!(self.writer.write_i8(v as i8));
-        } else if v >= i16::MIN as i64 && v <= i16::MAX as i64 {
-            try!(self.writer.write_u8(0x25));
-            try!(self.writer.write_i16::<LittleEndian>(v as i16));
-        } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-            try!(self.writer.write_u8(0x26));
-            try!(self.writer.write_i32::<LittleEndian>(v as i32));
-        } else {
-            try!(self.writer.write_u8(0x27));
-            try!(self.writer.write_i64::<LittleEndian>(v as i64));
-        }
-
-        return Ok(());
-    }
-
-    pub fn emit_f32(&mut self, v: f32) -> io::Result<()> {
-        try!(self.writer.write_u8(0x32));
-        try!(self.writer.write_f32::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_f64(&mut self, v: f64) -> io::Result<()> {
-        try!(self.writer.write_u8(0x33));
-        try!(self.writer.write_f64::<LittleEndian>(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_binary(&mut self, v: &[u8]) -> io::Result<()> {
-        try!(self.writer.write_u8(0x40));
-        try!(self.emit_length(v.len() as u64));
-        try!(self.writer.write_all(v));
-
-        return Ok(());
-    }
-
-    pub fn emit_string(&mut self, v: &str) -> io::Result<()> {
-        if v.len() < 0x0F && !self.dictionary.contains_key(v) {
-            try!(self.writer.write_u8(0xC0 + (v.len() as u8)));
-            try!(self.writer.write_all(v.as_bytes()));
-        } else {
-            try!(self.writer.write_u8(0x41));
-            try!(self.emit_string_fragment(v));
-        }
-
-        return Ok(());
-    }
-
-    pub fn emit_array_header(&mut self, length: u64) -> io::Result<()> {
-        if length < 0x0F {
-            try!(self.writer.write_u8(0xB0 + (length as u8)));
-        } else {
-            try!(self.writer.write_u8(0x50));
-            try!(self.emit_length(length));
-        }
-
-        return Ok(());
-    }
-
-    pub fn emit_map_header(&mut self, length: u64) -> io::Result<()> {
-        if length < 0x0F {
-            try!(self.writer.write_u8(0xA0 + (length as u8)));
-        } else {
-            try!(self.writer.write_u8(0x51));
-            try!(self.emit_length(length));
-        }
-
-        return Ok(());
-    }
-
-    pub fn emit_struct_header(&mut self, ty: &str, length: u64) -> io::Result<()> {
-        try!(self.writer.write_u8(0x60));
-        try!(self.emit_string_fragment(ty));
-        try!(self.emit_length(length));
-
-        return Ok(());
-    }
-
-    pub fn emit_object_header(&mut self, ty: &str, length: u64) -> io::Result<()> {
-        try!(self.writer.write_u8(0x61));
-        try!(self.emit_string_fragment(ty));
-        try!(self.emit_length(length));
-
-        return Ok(());
-    }
-
-    pub fn emit_guid(&mut self, v: [u8; 16]) -> io::Result<()> {
-        try!(self.writer.write_u8(0x70));
-        try!(self.writer.write_all(&v));
-
-        return Ok(());
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Encoder;
+// Binary(&'a [u8]),
+// String(&'a str),
+// StartArray(Option<usize>),
+// StartStruct(Option<usize>),
+// StartMap(Option<usize>),
+// StartOpenStruct(Option<usize>),
 
-    #[test]
-    fn encodes_short_length() {
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0x00).unwrap();
-        }
-
-        assert_eq!(result, vec![0x00]);
-
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0xEF).unwrap();
-        }
-
-        assert_eq!(result, vec![0xEF]);
-    }
-
-    #[test]
-    fn encodes_u8_length() {
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0xF0).unwrap();
-        }
-
-        assert_eq!(result, vec![0xF0, 0xF0]);
-
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0xFF).unwrap();
-        }
-
-        assert_eq!(result, vec![0xF0, 0xFF]);
-    }
-
-    #[test]
-    fn encodes_u16_length() {
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0xFFFF).unwrap();
-        }
-
-        assert_eq!(result, vec![0xF1, 0xFF, 0xFF]);
-    }
-
-    #[test]
-    fn encodes_u32_length() {
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0xFFFFFFFF).unwrap();
-        }
-
-        assert_eq!(result, vec![0xF2, 0xFF, 0xFF, 0xFF, 0xFF]);
-    }
-
-    #[test]
-    fn encodes_u64_length() {
-        let mut result = Vec::new();
-
-        {
-            Encoder::new(&mut result, vec![]).emit_length(0xFFFFFFFFFFFFFFFF).unwrap();
-        }
-
-        assert_eq!(result, vec![0xF3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-    }
-}
+// 0x08 => Event::Binary(try!(self.read_binary())),
+// 0x09 => Event::String(try!(self.read_string())),
+// 0x0A => {
+//     let length = try!(self.read_length());
+//
+//     self.push_stack(remaining - 1);
+//     self.push_stack(length);
+//
+//     return Ok(Some(Event::StartArray(Some(length))));
+// }
+// 0x0B => {
+//     let length = try!(self.read_length());
+//
+//     self.push_stack(remaining - 1);
+//     self.push_stack(length + 1);
+//
+//     return Ok(Some(Event::StartStruct(Some(length))));
+// }
+// 0x0C => {
+//     let length = try!(self.read_length());
+//
+//     self.push_stack(remaining - 1);
+//     self.push_stack(2 * length);
+//
+//     return Ok(Some(Event::StartMap(Some(length))));
+// }
+// 0x0D => {
+//     let length = try!(self.read_length());
+//
+//     self.push_stack(remaining - 1);
+//     self.push_stack(2 * length + 1);
+//
+//     return Ok(Some(Event::StartOpenStruct(Some(length))));
+// }
+// x if x & 0b10000000 == 0b10000000 => Event::String(try!(self.read_dictionary(x as usize & 0b01111111))),
+// x if x & 0b11100000 == 0b01100000 => Event::String(try!(self.read_string_data(x as usize & 0b00011111))),
+// x if x & 0b11110000 == 0b00100000 => {
+//     let length = x as usize & 0b00001111;
+//
+//     self.push_stack(remaining - 1);
+//     self.push_stack(length);
+//
+//     return Ok(Some(Event::StartArray(Some(length))));
+// },
+// x if x & 0b11110000 == 0b00110000 => {
+//     let length = x as usize & 0b00001111;
+//
+//     self.push_stack(remaining - 1);
+//     self.push_stack(2 * length);
+//
+//     return Ok(Some(Event::StartMap(Some(length))));
+// }
+// _ => {
+//     return Err(DecoderError::StreamError(ErrorCode::InvalidType));
+// }

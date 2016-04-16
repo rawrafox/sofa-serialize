@@ -2,25 +2,11 @@ use std::cmp;
 use std::io;
 use std::str;
 
-use decoder_error::{ErrorCode, DecoderError, DecoderResult};
-
 use byteorder::{LittleEndian, ReadBytesExt};
 
-#[derive(Clone, PartialEq, PartialOrd, Debug)]
-pub enum Event<'a> {
-    Nil,
-    Boolean(bool),
-    U8(u8), U16(u16), U32(u32), U64(u64),
-    I8(i8), I16(i16), I32(i32), I64(i64), Fixnum(&'a [u8]),
-    F32(f32), F64(f64),
-    Binary(&'a [u8]),
-    String(&'a str),
-    StartArray(Option<usize>),
-    StartStruct(Option<usize>),
-    StartMap(Option<usize>),
-    StartOpenStruct(Option<usize>),
-    End
-}
+use super::Event;
+
+use decoder_error::{ErrorCode, DecoderError, DecoderResult};
 
 pub trait BorrowRead<'a> : io::Read {
     fn fill_buffer(&self) -> &'a [u8];
@@ -174,6 +160,7 @@ impl<'a> Decoder<'a> {
                 }
 
                 let result = match try!(self.reader.read_u8()) {
+                    0x00 => panic!("Not implemented yet"), // End
                     0x01 => Event::Nil,
                     0x02 => Event::Boolean(false),
                     0x03 => Event::Boolean(true),
@@ -268,8 +255,9 @@ impl<'a> Iterator for Decoder<'a> {
 mod tests {
     use std::io;
 
+    use ::Event;
+
     use super::Decoder;
-    use super::Event;
 
     macro_rules! basic_test {
         ($identifier:ident, $input:expr, $output:expr) => {
