@@ -66,8 +66,13 @@ impl<'a> Encoder<'a> {
             return Ok(());
         }
 
-        try!(self.writer.write_u8(0x09));
-        try!(self.write_length(Size::U64(s.len() as u64)));
+        if s.len() <= 0b00011111 {
+            try!(self.writer.write_u8(0b01100000 | s.len() as u8));
+        } else {
+            try!(self.writer.write_u8(0x09));
+            try!(self.write_length(Size::U64(s.len() as u64)));
+        }
+
         try!(self.writer.write_all(s.as_bytes()));
 
         return Ok(());
