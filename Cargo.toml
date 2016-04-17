@@ -1,7 +1,7 @@
 [package]
-name = "sofa_serialize"
+name = "sofa-serialize"
 version = "0.1.0"
-authors = ["Aurora Morgan <aurora@aventine.se>"]
+authors = ["Aurora <aurora@aventine.se>"]
 
 [[bin]]
 name = "sofa-serialize"
