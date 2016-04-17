@@ -7,6 +7,7 @@ pub enum ErrorCode {
     EndOfStream,
     InvalidDictionaryIndex,
     InvalidEnd,
+    InvalidState,
     MissingEnd
 }
 

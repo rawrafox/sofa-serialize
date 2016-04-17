@@ -3,17 +3,27 @@ use std::io;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
-use super::Event;
+use super::{Event, Size};
 
 use encoder_error::{ErrorCode, EncoderError, EncoderResult};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Size { U64(u64), Streaming(usize, usize, usize) }
+enum StackSize { Streaming(u64, u64, u64), U64(u64) }
+
+impl StackSize {
+    fn from_size(size: Size, modulo: u64, required: u64) -> StackSize {
+        return match size {
+            Size::Streaming => StackSize::Streaming(0, modulo, required),
+            Size::U64(size) => StackSize::U64(modulo * size + required as u64)
+        };
+    }
+}
 
 pub struct Encoder<'a> {
     writer: &'a mut io::Write,
     dictionary: collections::HashMap<&'a str, usize>,
-    stack: Vec<Size>
+    stack: Vec<StackSize>,
+    invalid_state: bool
 }
 
 impl<'a> Encoder<'a> {
@@ -24,7 +34,12 @@ impl<'a> Encoder<'a> {
             map.insert(*e, i);
         }
 
-        return Encoder { writer: writer, dictionary: map, stack: vec![Size::U64(1)] };
+        return Encoder {
+            writer: writer,
+            dictionary: map,
+            stack: vec![StackSize::U64(1)],
+            invalid_state: false
+        };
     }
 
     #[inline]
@@ -59,187 +74,143 @@ impl<'a> Encoder<'a> {
     }
 
     #[inline]
-    fn push_stack(&mut self, remaining: Size) {
-        match remaining {
-            Size::U64(s) => self.stack.push(Size::U64(s - 1)),
-            Size::Streaming(n, modulo, required) => self.stack.push(Size::Streaming(n + 1, modulo, required))
-        }
-    }
+    fn remove_one_from_stack(&mut self) -> EncoderResult<()> {
+        let remaining = match self.stack.pop() {
+            Some(StackSize::U64(0)) => {
+                self.invalid_state = true;
 
-    #[inline]
-    fn push_stack_structure(&mut self, remaining: Size, structure_size: Size) {
-        self.push_stack(remaining);
-        self.stack.push(structure_size);
-    }
-
-
-    pub fn write(&mut self, event: &Event) -> EncoderResult<()> {
-        match self.stack.pop() {
-            Some(Size::U64(0)) => {
-                if *event != Event::End {
-                    return Err(EncoderError::StreamError(ErrorCode::MissingEnd));
-                } else {
-                    if self.stack.len() != 0 {
-                        return Ok(());
-                    } else {
-                        return Err(EncoderError::StreamError(ErrorCode::EndOfStream));
-                    }
-                }
+                return Err(EncoderError::StreamError(ErrorCode::MissingEnd));
             }
-            Some(remaining) => {
-                match *event {
-                    Event::Nil => {
-                        try!(self.writer.write_u8(0x01))
-                    }
-                    Event::Boolean(false) => {
-                        try!(self.writer.write_u8(0x02))
-                    }
-                    Event::Boolean(true) => {
-                        try!(self.writer.write_u8(0x03))
-                    }
-                    Event::U8(v) => {
-                        try!(self.writer.write_u8(0x10));
-                        try!(self.writer.write_u8(v));
-                    }
-                    Event::U16(v) => {
-                        try!(self.writer.write_u8(0x11));
-                        try!(self.writer.write_u16::<LittleEndian>(v));
-                    }
-                    Event::U32(v) => {
-                        try!(self.writer.write_u8(0x12));
-                        try!(self.writer.write_u32::<LittleEndian>(v));
-                    }
-                    Event::U64(v) => {
-                        try!(self.writer.write_u8(0x13));
-                        try!(self.writer.write_u64::<LittleEndian>(v));
-                    }
-                    Event::I8(v) => {
-                        try!(self.writer.write_u8(0x14));
-                        try!(self.writer.write_i8(v));
-                    }
-                    Event::I16(v) => {
-                        try!(self.writer.write_u8(0x15));
-                        try!(self.writer.write_i16::<LittleEndian>(v));
-                    }
-                    Event::I32(v) => {
-                        try!(self.writer.write_u8(0x16));
-                        try!(self.writer.write_i32::<LittleEndian>(v));
-                    }
-                    Event::I64(v) => {
-                        try!(self.writer.write_u8(0x17));
-                        try!(self.writer.write_i64::<LittleEndian>(v));
-                    }
-                    Event::Fixnum(_) => {
-                        panic!("Not implemented yet");
-                    }
-                    Event::F32(v) => {
-                        try!(self.writer.write_u8(0x1A));
-                        try!(self.writer.write_f32::<LittleEndian>(v));
-                    }
-                    Event::F64(v) => {
-                        try!(self.writer.write_u8(0x1B));
-                        try!(self.writer.write_f64::<LittleEndian>(v));
-                    }
-                    Event::Binary(v) => {
-                        try!(self.writer.write_u8(0x08));
-                        try!(self.write_length(Size::U64(v.len() as u64)));
-                        try!(self.writer.write_all(v));
-                    }
-                    Event::String(v) => try!(self.write_string(v)),
-                    Event::StartArray(v) => {
-                        match v {
-                            Some(length) if length < 0b00001111 => {
-                                try!(self.writer.write_u8(0b00100000 | length as u8));
-
-                                self.push_stack_structure(remaining, Size::U64(length as u64));
-
-                                return Ok(());
-                            }
-                            x => {
-                                let structure_size = match x {
-                                    None => Size::Streaming(0, 1, 0),
-                                    Some(size) => Size::U64(size as u64)
-                                };
-
-                                self.push_stack_structure(remaining, structure_size);
-
-                                try!(self.writer.write_u8(0x0A));
-
-                                return self.write_length(structure_size);
-                            }
-                        }
-                    }
-                    Event::StartStruct(v) => {
-                        let stack_size = match v {
-                            None => Size::Streaming(0, 1, 1),
-                            Some(size) => Size::U64(1 + size as u64)
-                        };
-
-                        let structure_size = match v {
-                            None => Size::Streaming(0, 1, 1),
-                            Some(size) => Size::U64(size as u64)
-                        };
-
-                        self.push_stack_structure(remaining, stack_size);
-
-                        try!(self.writer.write_u8(0x0B));
-
-                        return self.write_length(structure_size);
-                    }
-                    Event::StartMap(v) => {
-                        match v {
-                            Some(length) if length < 0b00001111 => {
-                                try!(self.writer.write_u8(0b00110000 | length as u8));
-
-                                self.push_stack_structure(remaining, Size::U64(2 * length as u64));
-
-                                return Ok(());
-                            }
-                            x => {
-                                let structure_size = match x {
-                                    None => Size::Streaming(0, 2, 0),
-                                    Some(size) => Size::U64(2 * size as u64)
-                                };
-
-                                self.push_stack_structure(remaining, structure_size);
-
-                                try!(self.writer.write_u8(0x0C));
-
-                                return self.write_length(structure_size);
-                            }
-                        }
-                    }
-                    Event::StartOpenStruct(v) => {
-                        let stack_size = match v {
-                            None => Size::Streaming(0, 2, 1),
-                            Some(size) => Size::U64(1 + 2 * size as u64)
-                        };
-
-                        let structure_size = match v {
-                            None => Size::Streaming(0, 2, 1),
-                            Some(size) => Size::U64(size as u64)
-                        };
-
-                        self.push_stack_structure(remaining, stack_size);
-
-                        try!(self.writer.write_u8(0x0D));
-
-                        return self.write_length(structure_size);
-                    }
-                    Event::End => {
-                        return match remaining {
-                            Size::Streaming(n, modulo, required) if n >= required && n % modulo == required => Ok(()),
-                            Size::U64(0) => Ok(()),
-                            _ => Err(EncoderError::StreamError(ErrorCode::InvalidEnd))
-                        };
-                    }
-                }
-
-                self.push_stack(remaining);
-            }
+            Some(StackSize::U64(s)) => StackSize::U64(s - 1),
+            Some(StackSize::Streaming(n, modulo, required)) => StackSize::Streaming(n + 1, modulo, required),
             None => {
+                self.invalid_state = true;
+
                 return Err(EncoderError::StreamError(ErrorCode::EndOfStream));
             }
+        };
+
+        self.stack.push(remaining);
+
+        return Ok(());
+    }
+
+    pub fn write(&mut self, event: &Event) -> EncoderResult<()> {
+        if self.invalid_state {
+            return Err(EncoderError::StreamError(ErrorCode::InvalidState));
+        }
+
+        if event == &Event::End {
+            return match self.stack.pop() {
+                Some(StackSize::U64(0)) => Ok(()),
+                Some(StackSize::Streaming(n, m, r)) if n >= r && n % m == r => Ok(()),
+                _ => {
+                    self.invalid_state = true;
+                    Err(EncoderError::StreamError(ErrorCode::InvalidEnd))
+                }
+            };
+        }
+
+        try!(self.remove_one_from_stack());
+
+        match *event {
+            Event::Nil => {
+                try!(self.writer.write_u8(0x01))
+            }
+            Event::Boolean(false) => {
+                try!(self.writer.write_u8(0x02))
+            }
+            Event::Boolean(true) => {
+                try!(self.writer.write_u8(0x03))
+            }
+            Event::U8(v) => {
+                try!(self.writer.write_u8(0x10));
+                try!(self.writer.write_u8(v));
+            }
+            Event::U16(v) => {
+                try!(self.writer.write_u8(0x11));
+                try!(self.writer.write_u16::<LittleEndian>(v));
+            }
+            Event::U32(v) => {
+                try!(self.writer.write_u8(0x12));
+                try!(self.writer.write_u32::<LittleEndian>(v));
+            }
+            Event::U64(v) => {
+                try!(self.writer.write_u8(0x13));
+                try!(self.writer.write_u64::<LittleEndian>(v));
+            }
+            Event::I8(v) => {
+                try!(self.writer.write_u8(0x14));
+                try!(self.writer.write_i8(v));
+            }
+            Event::I16(v) => {
+                try!(self.writer.write_u8(0x15));
+                try!(self.writer.write_i16::<LittleEndian>(v));
+            }
+            Event::I32(v) => {
+                try!(self.writer.write_u8(0x16));
+                try!(self.writer.write_i32::<LittleEndian>(v));
+            }
+            Event::I64(v) => {
+                try!(self.writer.write_u8(0x17));
+                try!(self.writer.write_i64::<LittleEndian>(v));
+            }
+            Event::Fixnum(_) => {
+                panic!("Not implemented yet");
+            }
+            Event::F32(v) => {
+                try!(self.writer.write_u8(0x1A));
+                try!(self.writer.write_f32::<LittleEndian>(v));
+            }
+            Event::F64(v) => {
+                try!(self.writer.write_u8(0x1B));
+                try!(self.writer.write_f64::<LittleEndian>(v));
+            }
+            Event::Binary(v) => {
+                try!(self.writer.write_u8(0x08));
+                try!(self.write_length(Size::U64(v.len() as u64)));
+                try!(self.writer.write_all(v));
+            }
+            Event::String(v) => try!(self.write_string(v)),
+            Event::StartArray(v) => {
+                match v {
+                    Size::U64(length) if length < 0b00001111 => {
+                        try!(self.writer.write_u8(0b00100000 | length as u8));
+                    }
+                    length => {
+                        try!(self.writer.write_u8(0x0A));
+                        try!(self.write_length(length));
+                    }
+                }
+
+                self.stack.push(StackSize::from_size(v, 1, 0));
+            }
+            Event::StartStruct(v) => {
+                try!(self.writer.write_u8(0x0B));
+                try!(self.write_length(v));
+
+                self.stack.push(StackSize::from_size(v, 1, 1));
+            }
+            Event::StartMap(v) => {
+                match v {
+                    Size::U64(length) if length < 0b00001111 => {
+                        try!(self.writer.write_u8(0b00110000 | length as u8));
+                    }
+                    length => {
+                        try!(self.writer.write_u8(0x0C));
+                        try!(self.write_length(length));
+                    }
+                }
+
+                self.stack.push(StackSize::from_size(v, 2, 0));
+            }
+            Event::StartOpenStruct(v) => {
+                try!(self.writer.write_u8(0x0D));
+                try!(self.write_length(v));
+
+                self.stack.push(StackSize::from_size(v, 2, 1));
+            }
+            Event::End => unreachable!()
         }
 
         return Ok(());

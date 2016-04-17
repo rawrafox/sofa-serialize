@@ -10,6 +10,11 @@ pub mod encoder_error;
 pub use decoder::Decoder;
 pub use encoder::Encoder;
 
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+pub enum Size {
+    Streaming, U64(u64)
+}
+
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
 pub enum Event<'a> {
     Nil,
@@ -19,10 +24,10 @@ pub enum Event<'a> {
     F32(f32), F64(f64),
     Binary(&'a [u8]),
     String(&'a str),
-    StartArray(Option<usize>),
-    StartStruct(Option<usize>),
-    StartMap(Option<usize>),
-    StartOpenStruct(Option<usize>),
+    StartArray(Size),
+    StartStruct(Size),
+    StartMap(Size),
+    StartOpenStruct(Size),
     End
 }
 
@@ -33,7 +38,7 @@ mod tests {
     use super::Decoder;
     use super::Encoder;
 
-    use super::Event;
+    use super::{Event, Size};
 
     macro_rules! basic_test {
         ($identifier:ident, $input:expr) => {
@@ -72,10 +77,10 @@ mod tests {
     basic_test!(transcodes_binary, vec![Event::Binary(&vec![0x01, 0x02, 0x03, 0x04])]);
     basic_test!(transcodes_string, vec![Event::String("🍪")]);
     basic_test!(transcodes_dictionary_string, vec![Event::String("🍪")], vec!["🍪"]);
-    basic_test!(transcodes_array, vec![Event::StartArray(Some(1)), Event::Nil, Event::End]);
-    basic_test!(transcodes_struct, vec![Event::StartStruct(Some(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
-    basic_test!(transcodes_map, vec![Event::StartMap(Some(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
-    basic_test!(transcodes_open_struct, vec![Event::StartOpenStruct(Some(1)), Event::String("🍪"), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(transcodes_array, vec![Event::StartArray(Size::U64(1)), Event::Nil, Event::End]);
+    basic_test!(transcodes_struct, vec![Event::StartStruct(Size::U64(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(transcodes_map, vec![Event::StartMap(Size::U64(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(transcodes_open_struct, vec![Event::StartOpenStruct(Size::U64(1)), Event::String("🍪"), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
     basic_test!(transcodes_u8, vec![Event::U8(0x50)]);
     basic_test!(transcodes_u16, vec![Event::U16(0x5150)]);
     basic_test!(transcodes_u32, vec![Event::U32(0x53525150)]);

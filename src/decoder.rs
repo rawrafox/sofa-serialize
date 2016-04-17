@@ -4,7 +4,7 @@ use std::str;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::Event;
+use super::{Event, Size};
 
 use decoder_error::{ErrorCode, DecoderError, DecoderResult};
 
@@ -172,7 +172,7 @@ impl<'a> Decoder<'a> {
                         self.push_stack(remaining - 1);
                         self.push_stack(length);
 
-                        return Ok(Some(Event::StartArray(Some(length))));
+                        return Ok(Some(Event::StartArray(Size::U64(length as u64))));
                     }
                     0x0B => {
                         let length = try!(self.read_length());
@@ -180,7 +180,7 @@ impl<'a> Decoder<'a> {
                         self.push_stack(remaining - 1);
                         self.push_stack(length + 1);
 
-                        return Ok(Some(Event::StartStruct(Some(length))));
+                        return Ok(Some(Event::StartStruct(Size::U64(length as u64))));
                     }
                     0x0C => {
                         let length = try!(self.read_length());
@@ -188,7 +188,7 @@ impl<'a> Decoder<'a> {
                         self.push_stack(remaining - 1);
                         self.push_stack(2 * length);
 
-                        return Ok(Some(Event::StartMap(Some(length))));
+                        return Ok(Some(Event::StartMap(Size::U64(length as u64))));
                     }
                     0x0D => {
                         let length = try!(self.read_length());
@@ -196,7 +196,7 @@ impl<'a> Decoder<'a> {
                         self.push_stack(remaining - 1);
                         self.push_stack(2 * length + 1);
 
-                        return Ok(Some(Event::StartOpenStruct(Some(length))));
+                        return Ok(Some(Event::StartOpenStruct(Size::U64(length as u64))));
                     }
                     0x10 => Event::U8(try!(self.reader.read_u8())),
                     0x11 => Event::U16(try!(self.reader.read_u16::<LittleEndian>())),
@@ -217,7 +217,7 @@ impl<'a> Decoder<'a> {
                         self.push_stack(remaining - 1);
                         self.push_stack(length);
 
-                        return Ok(Some(Event::StartArray(Some(length))));
+                        return Ok(Some(Event::StartArray((Size::U64(length as u64)))));
                     },
                     x if x & 0b11110000 == 0b00110000 => {
                         let length = x as usize & 0b00001111;
@@ -225,7 +225,7 @@ impl<'a> Decoder<'a> {
                         self.push_stack(remaining - 1);
                         self.push_stack(2 * length);
 
-                        return Ok(Some(Event::StartMap(Some(length))));
+                        return Ok(Some(Event::StartMap(Size::U64(length as u64))));
                     }
                     _ => {
                         return Err(DecoderError::StreamError(ErrorCode::InvalidType));
@@ -255,7 +255,7 @@ impl<'a> Iterator for Decoder<'a> {
 mod tests {
     use std::io;
 
-    use ::Event;
+    use ::{Event, Size};
 
     use super::Decoder;
 
@@ -285,12 +285,12 @@ mod tests {
     basic_test!(decodes_string, vec![0x64, 0xF0, 0x9F, 0x8D, 0xAA], vec![Event::String("🍪")]);
     basic_test!(decodes_dictionary_string, vec![0x80], vec![Event::String("🍪")], vec!["🍪"]);
     basic_test!(decodes_noncanonical_string, vec![0x09, 0x04, 0xF0, 0x9F, 0x8D, 0xAA], vec![Event::String("🍪")]);
-    basic_test!(decodes_array, vec![0x21, 0x01], vec![Event::StartArray(Some(1)), Event::Nil, Event::End]);
-    basic_test!(decodes_noncanonical_array, vec![0x0A, 0x02, 0x01, 0x01], vec![Event::StartArray(Some(2)), Event::Nil, Event::Nil, Event::End]);
-    basic_test!(decodes_struct, vec![0x0B, 0x01, 0x80, 0x02], vec![Event::StartStruct(Some(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
-    basic_test!(decodes_map, vec![0x0C, 0x01, 0x80, 0x02], vec![Event::StartMap(Some(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
-    basic_test!(decodes_noncanonical_map, vec![0x0C, 0x01, 0x80, 0x02], vec![Event::StartMap(Some(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
-    basic_test!(decodes_open_struct, vec![0x0D, 0x01, 0x80, 0x80, 0x02], vec![Event::StartOpenStruct(Some(1)), Event::String("🍪"), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(decodes_array, vec![0x21, 0x01], vec![Event::StartArray(Size::U64(1)), Event::Nil, Event::End]);
+    basic_test!(decodes_noncanonical_array, vec![0x0A, 0x02, 0x01, 0x01], vec![Event::StartArray(Size::U64(2)), Event::Nil, Event::Nil, Event::End]);
+    basic_test!(decodes_struct, vec![0x0B, 0x01, 0x80, 0x02], vec![Event::StartStruct(Size::U64(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(decodes_map, vec![0x0C, 0x01, 0x80, 0x02], vec![Event::StartMap(Size::U64(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(decodes_noncanonical_map, vec![0x0C, 0x01, 0x80, 0x02], vec![Event::StartMap(Size::U64(1)), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
+    basic_test!(decodes_open_struct, vec![0x0D, 0x01, 0x80, 0x80, 0x02], vec![Event::StartOpenStruct(Size::U64(1)), Event::String("🍪"), Event::String("🍪"), Event::Boolean(false), Event::End], vec!["🍪"]);
     basic_test!(decodes_u8, vec![0x10, 0x50], vec![Event::U8(0x50)]);
     basic_test!(decodes_u16, vec![0x11, 0x50, 0x51], vec![Event::U16(0x5150)]);
     basic_test!(decodes_u32, vec![0x12, 0x50, 0x51, 0x52, 0x53], vec![Event::U32(0x53525150)]);
